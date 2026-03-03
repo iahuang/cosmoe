@@ -84,9 +84,11 @@ impl<T: candle_nn::Module> ExpertCache<T> {
             neg_mod(self.evictor_current_layer as i64 - 1, self.n_layers as i64) as usize;
 
         while curr_layer != self.evictor_current_layer {
-            let entry = self.get_entry(curr_layer, 0)?;
-            if entry.evictable {
-                return Ok((curr_layer, 0));
+            for expert in 0..self.n_experts_per_layer {
+                let entry = self.get_entry(curr_layer, expert)?;
+                if entry.evictable && entry.module.is_some() {
+                    return Ok((curr_layer, expert));
+                }
             }
             curr_layer = neg_mod(curr_layer as i64 - 1, self.n_layers as i64) as usize;
         }
@@ -144,10 +146,12 @@ impl<T: candle_nn::Module> ExpertCache<T> {
         let entry = self.get_entry_mut(idx_layer, idx_expert)?;
 
         if !entry.module.is_some() {
+            self.ensure_occupancy()?;
             self.get_entry_mut(idx_layer, idx_expert)?.module =
                 Some((self.module_factory)(idx_layer, idx_expert)?);
-            self.ensure_occupancy();
             self.occupancy_current += 1;
+            println!("Created expert for layer {} expert {}. Current occupancy: {}", idx_layer, idx_expert, self.occupancy_current);
+
         }
 
         Ok(self
@@ -166,7 +170,7 @@ impl<T: candle_nn::Module> ExpertCache<T> {
         let entry = self.get_entry_mut(idx_layer, idx_expert)?;
 
         if !entry.module.is_some() {
-            self.ensure_occupancy();
+            self.ensure_occupancy()?;
             self.occupancy_current += 1;
         }
 
@@ -210,3 +214,4 @@ impl From<ModuleCacheError> for candle_core::Error {
         candle_core::Error::Wrapped(Box::new(error))
     }
 }
+

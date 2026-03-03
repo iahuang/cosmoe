@@ -1,9 +1,10 @@
-mod mixtral2;
+mod mixtral_offloading;
+mod mixtral_original;
 mod expert_cache;
 
 use anyhow::{Error as E, Result};
 
-use mixtral2::{Config, Model};
+use mixtral_offloading::{Config, Model};
 
 use candle_core::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
@@ -196,7 +197,7 @@ fn main() -> Result<()> {
     let device = candle_examples::device(false)?;
     let dtype = device.bf16_default_to_f32();
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    let model = Model::new(&config, 2, vb)?;
+    let model = Model::new(&config, 9, vb)?;
     println!("loaded the model in {:?}", start.elapsed());
 
     let mut pipeline = TextGeneration::new(

@@ -336,7 +336,9 @@ impl SparseMoeBlock {
             }
             let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
             let selected_rws =
-                Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?.reshape(((), 1))?;
+                Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?
+                    .to_dtype(xs.dtype())?
+                    .reshape(((), 1))?;
             // Index the correct hidden states and compute the expert hidden state for
             // the current expert. We need to make sure to multiply the output hidden
             // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
@@ -436,7 +438,6 @@ impl Model {
         let layers_vb = vb.pp("model").pp("layers");
 
         let factory: Box<ExpertFactory<BlockSparseTop2MLP>> = Box::new(move |layer, expert| {
-            println!("Creating expert for layer {} expert {}", layer, expert);
             let expert_vb = layers_vb
                 .pp(layer)
                 .pp("block_sparse_moe")
@@ -493,6 +494,7 @@ impl Model {
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        println!("Forwarding {:?} ids with seqlen_offset: {}", input_ids.shape(), seqlen_offset);
         let (b_size, seq_len) = input_ids.dims2()?;
         let attention_mask = if seq_len <= 1 {
             None
