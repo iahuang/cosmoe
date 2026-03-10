@@ -13,7 +13,7 @@ use std::sync::Arc;
 use candle_core::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::Tokenizer;
 
 use pread_loader::PreadTensorLoader;
@@ -202,9 +202,7 @@ fn main() -> Result<()> {
     let device = candle_examples::device(false)?;
 
     // Create the GGUF-based tensor loader.
-    let loader = Arc::new(
-        PreadTensorLoader::new(&gguf_path).map_err(|e| anyhow::anyhow!("{}", e))?,
-    );
+    let loader = PreadTensorLoader::new(&gguf_path).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let model = Model::new(&config, 9, loader, &device)?;
     println!("loaded the model in {:?}", start.elapsed());

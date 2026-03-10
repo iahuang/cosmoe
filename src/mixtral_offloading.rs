@@ -5,12 +5,12 @@
 //! from a GGUF file via pread().
 
 use candle_core::quantized::{QMatMul, QTensor};
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::Activation;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::expert_cache::{ExpertCache, ExpertFactoryResult};
+use crate::expert_cache::{ExpertCache, ExpertCacheConfig, ExpertFactoryResult};
 use crate::pread_loader::PreadTensorLoader;
 
 /// Mixtral configuration. Same as before but read from GGUF metadata at runtime.
@@ -260,10 +260,8 @@ impl Attention {
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        let key_states =
-            candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?;
-        let value_states =
-            candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
+        let key_states = candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?;
+        let value_states = candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
 
         let attn_output = if self.use_flash_attn {
             let q = query_states.transpose(1, 2)?;
@@ -273,8 +271,7 @@ impl Attention {
             flash_attn(&q, &k, &v, softmax_scale, q_len > 1)?.transpose(1, 2)?
         } else {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights =
-                (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
 
             let attn_weights = match attention_mask {
                 None => attn_weights,
@@ -331,11 +328,7 @@ struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    fn new(
-        cfg: &Config,
-        this_layer: usize,
-        gate_tensor: Arc<QTensor>,
-    ) -> Result<Self> {
+    fn new(cfg: &Config, this_layer: usize, gate_tensor: Arc<QTensor>) -> Result<Self> {
         let gate = Linear::from_arc(gate_tensor)?;
         Ok(SparseMoeBlock {
             gate,
@@ -386,10 +379,10 @@ impl SparseMoeBlock {
                 continue;
             }
             let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-            let selected_rws = Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?
-                .reshape(((), 1))?;
+            let selected_rws =
+                Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?.reshape(((), 1))?;
             let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
-            let expert_layer = expert_cache.get(self.this_layer, expert_idx)?;
+            let expert_layer = expert_cache.get_blocking(self.this_layer, expert_idx)?;
             let current_hidden_states = expert_layer.forward(&current_state)?;
             let current_hidden_states = current_hidden_states.broadcast_mul(&selected_rws)?;
             ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
@@ -478,7 +471,7 @@ impl Model {
     pub fn new(
         cfg: &Config,
         expert_cache_occupancy_limit: usize,
-        loader: Arc<PreadTensorLoader>,
+        loader: PreadTensorLoader,
         device: &Device,
     ) -> Result<Self> {
         // Load non-expert tensors explicitly.
@@ -527,42 +520,41 @@ impl Model {
         let device_f = device.clone();
         let load_count = std::sync::atomic::AtomicUsize::new(0);
 
-        let factory: Box<ExpertFactory<BlockSparseTop2MLP>> =
-            Box::new(move |layer, expert| {
-                let n = load_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let start = std::time::Instant::now();
-
-                // GGUF per-expert tensor names:
-                //   blk.{layer}.ffn_gate.{expert}.weight  (w1)
-                //   blk.{layer}.ffn_down.{expert}.weight  (w2)
-                //   blk.{layer}.ffn_up.{expert}.weight    (w3)
-                let w1 = loader.load_qtensor(
-                    &format!("blk.{layer}.ffn_gate.{expert}.weight"),
-                    &device_f,
-                )?;
-                let w2 = loader.load_qtensor(
-                    &format!("blk.{layer}.ffn_down.{expert}.weight"),
-                    &device_f,
-                )?;
-                let w3 = loader.load_qtensor(
-                    &format!("blk.{layer}.ffn_up.{expert}.weight"),
-                    &device_f,
-                )?;
-
-                let result = BlockSparseTop2MLP::from_qtensors(w1, w2, w3, cfg_f.hidden_act);
-                println!(
-                    "BlockSparseTop2MLP::new(layer={}, expert={}, load#={}) took {:?}",
-                    layer, expert, n, start.elapsed()
-                );
-                Ok(result?)
-            });
-
-        let expert_cache = ExpertCache::new(
-            cfg.num_hidden_layers,
-            cfg.num_local_experts,
-            factory,
-            expert_cache_occupancy_limit,
-        );
+        let expert_cache = ExpertCache::new(ExpertCacheConfig {
+            n_layers: cfg.num_hidden_layers,
+            n_experts_per_layer: cfg.num_experts_per_tok,
+            expert_factory: Box::new(move |mut expert_package| {
+                let (layer, expert) = expert_package.expert;
+                let w1 = expert_package
+                    .tensors
+                    .remove(&format!("blk.{layer}.ffn_gate.{expert}.weight"))
+                    .unwrap();
+                let w2 = expert_package
+                    .tensors
+                    .remove(&format!("blk.{layer}.ffn_down.{expert}.weight"))
+                    .unwrap();
+                let w3 = expert_package
+                    .tensors
+                    .remove(&format!("blk.{layer}.ffn_up.{expert}.weight"))
+                    .unwrap();
+                Ok(BlockSparseTop2MLP::from_qtensors(
+                    w1,
+                    w2,
+                    w3,
+                    cfg_f.hidden_act,
+                )?)
+            }),
+            expert_spec: Box::new(|layer, expert| {
+                vec![
+                    format!("blk.{layer}.ffn_gate.{expert}.weight"),
+                    format!("blk.{layer}.ffn_down.{expert}.weight"),
+                    format!("blk.{layer}.ffn_up.{expert}.weight"),
+                ]
+            }),
+            occupancy_limit: expert_cache_occupancy_limit,
+            device: device.clone(),
+            loader: loader,
+        });
 
         Ok(Self {
             embed_tokens,
@@ -613,8 +605,7 @@ impl Model {
         let attention_mask = if seq_len <= 1 {
             None
         } else {
-            let mask =
-                self.prepare_decoder_attention_mask(b_size, seq_len, seqlen_offset)?;
+            let mask = self.prepare_decoder_attention_mask(b_size, seq_len, seqlen_offset)?;
             Some(mask)
         };
         let mut xs = self.embed_tokens.forward(input_ids)?;

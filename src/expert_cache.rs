@@ -25,8 +25,8 @@ pub enum ExpertCacheEntryState<T: candle_nn::Module> {
 }
 
 pub struct ExpertPackage {
-    tensors: HashMap<String, QTensor>,
-    expert: (usize, usize),
+    pub tensors: HashMap<String, QTensor>,
+    pub expert: (usize, usize),
 }
 
 impl Primitive for (usize, usize) {}
