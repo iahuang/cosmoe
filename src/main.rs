@@ -1,7 +1,8 @@
+mod expert_cache;
 mod mixtral_offloading;
 mod mixtral_original;
-mod expert_cache;
 mod pread_loader;
+mod prefetcher;
 
 use anyhow::{Error as E, Result};
 
@@ -11,7 +12,6 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
@@ -132,12 +132,16 @@ struct Args {
     /// The length of the sample to generate (in tokens).
     sample_len: usize,
 
+    /// HF repo for the GGUF model file.
     model_id: String,
 
-    revision: String,
+    /// Filename of the GGUF file within the repo.
+    gguf_filename: String,
+
+    /// HF repo for the tokenizer (GGUF repos often don't include one).
+    tokenizer_repo: String,
 
     tokenizer_file: Option<String>,
-    weight_files: Option<String>,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     repeat_penalty: f32,
@@ -154,10 +158,10 @@ fn main() -> Result<()> {
         top_p: None,
         seed: 299792458,
         sample_len: 10000,
-        model_id: "mistralai/Mixtral-8x7B-v0.1".to_string(),
-        revision: "main".to_string(),
+        model_id: "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF".to_string(),
+        gguf_filename: "mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf".to_string(),
+        tokenizer_repo: "mistralai/Mixtral-8x7B-Instruct-v0.1".to_string(),
         tokenizer_file: None,
-        weight_files: None,
         repeat_penalty: 1.1,
         repeat_last_n: 64,
     };
@@ -178,34 +182,31 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let api = Api::new()?;
-    let repo = api.repo(Repo::with_revision(
-        args.model_id,
-        RepoType::Model,
-        args.revision,
-    ));
+
+    // Download tokenizer from the original model repo.
+    let tokenizer_repo = api.repo(Repo::new(args.tokenizer_repo, RepoType::Model));
     let tokenizer_filename = match args.tokenizer_file {
         Some(file) => std::path::PathBuf::from(file),
-        None => repo.get("tokenizer.json")?,
+        None => tokenizer_repo.get("tokenizer.json")?,
     };
-    let filenames = match args.weight_files {
-        Some(files) => files
-            .split(',')
-            .map(std::path::PathBuf::from)
-            .collect::<Vec<_>>(),
-        None => candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
-    };
+
+    // Download the GGUF file.
+    let gguf_repo = api.repo(Repo::new(args.model_id, RepoType::Model));
+    let gguf_path = gguf_repo.get(&args.gguf_filename)?;
     println!("retrieved the files in {:?}", start.elapsed());
+
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
     let start = std::time::Instant::now();
     let config = Config::v0_1_8x7b(args.use_flash_attn);
     let device = candle_examples::device(false)?;
-    let dtype = DType::BF16;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    let expert_loader = Arc::new(
-        PreadTensorLoader::new(&filenames).map_err(|e| anyhow::anyhow!("{}", e))?,
+
+    // Create the GGUF-based tensor loader.
+    let loader = Arc::new(
+        PreadTensorLoader::new(&gguf_path).map_err(|e| anyhow::anyhow!("{}", e))?,
     );
-    let model = Model::new(&config, 9, vb, expert_loader)?;
+
+    let model = Model::new(&config, 9, loader, &device)?;
     println!("loaded the model in {:?}", start.elapsed());
 
     let mut pipeline = TextGeneration::new(
@@ -221,4 +222,3 @@ fn main() -> Result<()> {
     pipeline.run(&args.prompt, args.sample_len)?;
     Ok(())
 }
-

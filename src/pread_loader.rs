@@ -1,184 +1,92 @@
-//! Expert weight loader using pread() for direct I/O instead of mmap.
+//! Expert weight loader using pread() for direct I/O from GGUF files.
 //!
-//! Parses safetensors headers at startup to build a tensor index mapping
-//! tensor names to (file_descriptor, byte_offset, byte_length, dtype, shape).
-//! On demand, reads exact byte ranges with pread() and creates Metal tensors
-//! via Tensor::from_raw_buffer(). Sets F_NOCACHE on file descriptors to bypass
+//! Parses the GGUF header at startup to build a tensor index mapping
+//! tensor names to (byte_offset, byte_length, ggml_dtype, shape).
+//! On demand, reads exact byte ranges with pread() and creates QTensors
+//! via qtensor_from_ggml(). Sets F_NOCACHE on the file descriptor to bypass
 //! the OS page cache, avoiding cache-on-cache interference with Metal buffers.
+//!
+//! This loader expects per-expert tensors (unfused):
+//!   blk.{layer}.ffn_gate.{expert}.weight  (w1)
+//!   blk.{layer}.ffn_down.{expert}.weight  (w2)
+//!   blk.{layer}.ffn_up.{expert}.weight    (w3)
 
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::VarBuilder;
+use candle_core::quantized::ggml_file::qtensor_from_ggml;
+use candle_core::quantized::gguf_file;
+use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::{Device, Result};
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::BufReader;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-/// Metadata for a single tensor within a safetensors file.
-#[derive(Debug, Clone)]
-struct TensorMeta {
-    /// Index into the `files` vec.
-    file_idx: usize,
-    /// Absolute byte offset from start of file to tensor data.
-    data_offset: usize,
-    /// Byte length of tensor data.
-    data_len: usize,
-    /// Tensor dtype (safetensors dtype mapped to candle DType).
-    dtype: DType,
-    /// Tensor shape.
-    shape: Vec<usize>,
-}
-
-/// Maps safetensors dtype to candle DType.
-fn st_dtype_to_candle(dtype: safetensors::Dtype) -> std::result::Result<DType, String> {
-    match dtype {
-        safetensors::Dtype::F16 => Ok(DType::F16),
-        safetensors::Dtype::BF16 => Ok(DType::BF16),
-        safetensors::Dtype::F32 => Ok(DType::F32),
-        safetensors::Dtype::F64 => Ok(DType::F64),
-        safetensors::Dtype::U8 => Ok(DType::U8),
-        safetensors::Dtype::U32 => Ok(DType::U32),
-        safetensors::Dtype::I64 => Ok(DType::I64),
-        other => Err(format!("unsupported safetensors dtype: {:?}", other)),
-    }
-}
-
-/// Holds open file descriptors and a tensor name → metadata index.
-/// Designed for use as a `SimpleBackend` for `VarBuilder`.
+/// Holds an open file descriptor and the parsed GGUF tensor index.
+/// Loads tensors on demand via pread() into QTensors.
 pub struct PreadTensorLoader {
-    files: Vec<File>,
-    tensor_index: HashMap<String, TensorMeta>,
+    file: File,
+    tensor_infos: HashMap<String, gguf_file::TensorInfo>,
+    tensor_data_offset: u64,
+    /// GGUF metadata (model hyperparameters, etc.)
+    pub metadata: HashMap<String, gguf_file::Value>,
     /// Reusable read buffers keyed by byte size. Avoids repeated allocation
     /// and page faulting for the temporary Vec<u8> used by pread.
     read_buffers: Mutex<HashMap<usize, Vec<u8>>>,
 }
 
 impl PreadTensorLoader {
-    /// Parse safetensors headers from multiple files and build the tensor index.
-    /// Sets F_NOCACHE on each file descriptor to bypass OS page cache.
-    pub fn new<P: AsRef<Path>>(paths: &[P]) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let mut files = Vec::with_capacity(paths.len());
-        let mut tensor_index = HashMap::new();
+    /// Parse the GGUF header and build the tensor index.
+    /// Sets F_NOCACHE on the file descriptor to bypass OS page cache.
+    pub fn new<P: AsRef<Path>>(path: P) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let file = File::open(path.as_ref())?;
 
-        for (file_idx, path) in paths.iter().enumerate() {
-            let file = File::open(path.as_ref())?;
-
-            // Set F_NOCACHE to bypass OS page cache on macOS.
-            #[cfg(target_os = "macos")]
-            {
-                let fd = file.as_raw_fd();
-                unsafe {
-                    libc::fcntl(fd, libc::F_NOCACHE, 1);
-                }
+        // Set F_NOCACHE to bypass OS page cache on macOS.
+        #[cfg(target_os = "macos")]
+        {
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::fcntl(fd, libc::F_NOCACHE, 1);
             }
-
-            // Read the 8-byte header length.
-            let mut header_len_buf = [0u8; 8];
-            let n = pread_exact(file.as_raw_fd(), &mut header_len_buf, 0)?;
-            if n != 8 {
-                return Err(format!("failed to read header length from {:?}", path.as_ref()).into());
-            }
-            let header_len = u64::from_le_bytes(header_len_buf) as usize;
-
-            // Read the JSON header.
-            let mut header_buf = vec![0u8; header_len];
-            pread_exact(file.as_raw_fd(), &mut header_buf, 8)?;
-
-            // The data section starts after 8 bytes + header_len.
-            let data_start = 8 + header_len;
-
-            // Parse the header to extract tensor metadata.
-            // We use safetensors' deserialize on a minimal buffer: header + 0 bytes of data.
-            // Instead, parse the JSON directly for offset info.
-            let header_json: serde_json::Value = serde_json::from_slice(&header_buf)?;
-
-            if let serde_json::Value::Object(map) = header_json {
-                for (name, info) in map {
-                    // Skip __metadata__ key
-                    if name == "__metadata__" {
-                        continue;
-                    }
-                    let obj = info.as_object().ok_or_else(|| {
-                        format!("expected object for tensor '{}' in {:?}", name, path.as_ref())
-                    })?;
-
-                    let dtype_str = obj
-                        .get("dtype")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| format!("missing dtype for '{}'", name))?;
-                    let st_dtype = match dtype_str {
-                        "F16" => safetensors::Dtype::F16,
-                        "BF16" => safetensors::Dtype::BF16,
-                        "F32" => safetensors::Dtype::F32,
-                        "F64" => safetensors::Dtype::F64,
-                        "U8" => safetensors::Dtype::U8,
-                        "U32" => safetensors::Dtype::U32,
-                        "I64" => safetensors::Dtype::I64,
-                        other => return Err(format!("unsupported dtype '{}' for '{}'", other, name).into()),
-                    };
-                    let dtype = st_dtype_to_candle(st_dtype)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-                    let shape: Vec<usize> = obj
-                        .get("shape")
-                        .and_then(|v| v.as_array())
-                        .ok_or_else(|| format!("missing shape for '{}'", name))?
-                        .iter()
-                        .map(|v| v.as_u64().unwrap_or(0) as usize)
-                        .collect();
-
-                    let offsets = obj
-                        .get("data_offsets")
-                        .and_then(|v| v.as_array())
-                        .ok_or_else(|| format!("missing data_offsets for '{}'", name))?;
-                    let start = offsets[0].as_u64().unwrap_or(0) as usize;
-                    let end = offsets[1].as_u64().unwrap_or(0) as usize;
-
-                    tensor_index.insert(
-                        name,
-                        TensorMeta {
-                            file_idx,
-                            data_offset: data_start + start,
-                            data_len: end - start,
-                            dtype,
-                            shape,
-                        },
-                    );
-                }
-            }
-
-            files.push(file);
         }
 
+        // Parse the GGUF header (metadata + tensor infos).
+        let mut reader = BufReader::new(&file);
+        let content = gguf_file::Content::read(&mut reader)?;
+
         Ok(Self {
-            files,
-            tensor_index,
+            file,
+            tensor_infos: content.tensor_infos,
+            tensor_data_offset: content.tensor_data_offset,
+            metadata: content.metadata,
             read_buffers: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Load a single tensor by name onto the given device.
-    fn load_tensor(&self, name: &str, device: &Device) -> Result<Tensor> {
-        let meta = self.tensor_index.get(name).ok_or_else(|| {
+    /// Load a single tensor by name onto the given device as a QTensor.
+    pub fn load_qtensor(&self, name: &str, device: &Device) -> Result<QTensor> {
+        let info = self.tensor_infos.get(name).ok_or_else(|| {
             candle_core::Error::CannotFindTensor {
                 path: name.to_string(),
             }
             .bt()
         })?;
 
-        let fd = self.files[meta.file_idx].as_raw_fd();
-        let size = meta.data_len;
+        let elem_count: usize = info.shape.elem_count();
+        let block_size = info.ggml_dtype.block_size();
+        let size = elem_count / block_size * info.ggml_dtype.type_size();
+        let absolute_offset = self.tensor_data_offset + info.offset;
+        let fd = self.file.as_raw_fd();
 
         // Take the reusable buffer from the pool (or allocate + fault in a new one).
         let t0 = std::time::Instant::now();
         let mut buf = self
             .read_buffers
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .remove(&size)
             .unwrap_or_else(|| {
                 let mut b = vec![0u8; size];
-                // Touch every page to force the OS to map physical pages now,
-                // so pread doesn't pay for page faults later.
                 let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
                 for offset in (0..size).step_by(page_size) {
                     b[offset] = 0;
@@ -187,101 +95,36 @@ impl PreadTensorLoader {
             });
         let t1 = std::time::Instant::now();
 
-        pread_exact(fd, &mut buf, meta.data_offset as i64).map_err(|e| {
+        pread_exact(fd, &mut buf, absolute_offset as i64).map_err(|e| {
             candle_core::Error::Msg(format!("pread failed for '{}': {}", name, e))
         })?;
         let t2 = std::time::Instant::now();
 
-        let tensor = Tensor::from_raw_buffer(&buf, meta.dtype, &meta.shape, device)?;
+        let qtensor = qtensor_from_ggml(
+            info.ggml_dtype,
+            &buf,
+            info.shape.dims().to_vec(),
+            device,
+        )?;
         let t3 = std::time::Instant::now();
 
         // Return buffer to the pool for reuse.
         self.read_buffers.lock().unwrap().insert(size, buf);
 
         println!(
-            "  load_tensor({}): buf={:.1}ms pread={:.1}ms from_raw_buffer={:.1}ms total={:.1}ms",
-            name.rsplit('.').nth(1).unwrap_or(name),
+            "  load({}): buf={:.1}ms pread={:.1}ms qtensor={:.1}ms total={:.1}ms ({} bytes, {:?})",
+            name,
             (t1 - t0).as_secs_f64() * 1000.0,
             (t2 - t1).as_secs_f64() * 1000.0,
             (t3 - t2).as_secs_f64() * 1000.0,
             (t3 - t0).as_secs_f64() * 1000.0,
+            size,
+            info.ggml_dtype,
         );
-        Ok(tensor)
+        Ok(qtensor)
     }
 
-    /// Create a VarBuilder backed by this pread loader with a prefix prepended
-    /// to all tensor name lookups. For example, with prefix
-    /// `"model.layers.0.block_sparse_moe.experts.0"`, a VarBuilder `.pp("w1")`
-    /// lookup for `"w1.weight"` resolves to the full tensor name
-    /// `"model.layers.0.block_sparse_moe.experts.0.w1.weight"`.
-    pub fn var_builder(&self, dtype: DType, device: &Device, prefix: &str) -> VarBuilder<'_> {
-        let backend = PreadBackend {
-            loader: self,
-            prefix: prefix.to_string(),
-        };
-        VarBuilder::from_backend(Box::new(backend), dtype, device.clone())
-    }
 }
-
-/// Wrapper to implement SimpleBackend, prepending a fixed prefix to tensor names.
-struct PreadBackend<'a> {
-    loader: &'a PreadTensorLoader,
-    prefix: String,
-}
-
-impl PreadBackend<'_> {
-    fn full_name(&self, name: &str) -> String {
-        if self.prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}.{}", self.prefix, name)
-        }
-    }
-}
-
-impl candle_nn::var_builder::SimpleBackend for PreadBackend<'_> {
-    fn get(
-        &self,
-        s: candle_core::Shape,
-        name: &str,
-        _h: candle_nn::Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<Tensor> {
-        let full = self.full_name(name);
-        let tensor = self.loader.load_tensor(&full, dev)?;
-        if tensor.shape() != &s {
-            return Err(candle_core::Error::UnexpectedShape {
-                msg: format!(
-                    "shape mismatch for '{}': expected {:?}, got {:?}",
-                    full,
-                    s,
-                    tensor.shape()
-                ),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
-            .bt());
-        }
-        tensor.to_dtype(dtype)
-    }
-
-    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
-        let full = self.full_name(name);
-        self.loader.load_tensor(&full, dev)?.to_dtype(dtype)
-    }
-
-    fn contains_tensor(&self, name: &str) -> bool {
-        let full = self.full_name(name);
-        self.loader.tensor_index.contains_key(&full)
-    }
-}
-
-// Safety: PreadBackend holds a shared reference to PreadTensorLoader (File handles
-// + HashMap, both Send+Sync) and a String. pread() is thread-safe as it doesn't
-// modify the file descriptor's seek offset.
-unsafe impl Send for PreadBackend<'_> {}
-unsafe impl Sync for PreadBackend<'_> {}
 
 /// pread() wrapper that reads exactly `buf.len()` bytes, retrying on partial reads.
 fn pread_exact(fd: i32, buf: &mut [u8], mut offset: i64) -> std::io::Result<usize> {
@@ -306,7 +149,10 @@ fn pread_exact(fd: i32, buf: &mut [u8], mut offset: i64) -> std::io::Result<usiz
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("pread: unexpected EOF at offset {} (read {}/{})", offset, filled, total),
+                format!(
+                    "pread: unexpected EOF at offset {} (read {}/{})",
+                    offset, filled, total
+                ),
             ));
         }
         filled += n as usize;

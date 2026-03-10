@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+byteorder = "1"
 candle-core = { version = "0.9.2", features = ["metal"] }
 candle-examples = { version = "0.9.2", features = ["metal"] }
 candle-nn = { version = "0.9.2", features = ["metal"] }
 candle-transformers = { version = "0.9.2", features = ["metal"] }
+flume = "0.12.0"
 hf-hub = "0.4.3"
 libc = "0.2"
 safetensors = "0.4"
