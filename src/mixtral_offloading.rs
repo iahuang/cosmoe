@@ -522,7 +522,7 @@ impl Model {
 
         let expert_cache = ExpertCache::new(ExpertCacheConfig {
             n_layers: cfg.num_hidden_layers,
-            n_experts_per_layer: cfg.num_experts_per_tok,
+            n_experts_per_layer: cfg.num_local_experts,
             expert_factory: Box::new(move |mut expert_package| {
                 let (layer, expert) = expert_package.expert;
                 let w1 = expert_package
