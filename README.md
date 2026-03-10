@@ -1,6 +1,6 @@
 # Cosmoe
 
-*Enabling inference of large mixture-of-experts (MoE) models on Apple Silicon using dynamic offloading.*
+Cosmoe is an inference engine for large mixture-of-experts (MoE) models on Apple Silicon machines that leverages dynamic offloading to disk in order to enable inference of models whose _total parameter size exceeds available memory_.
 
 ## Motivation
 
@@ -10,4 +10,4 @@ Apple Silicon machines have emerged as an unexpectedly popular platform for loca
 
 ---
 
-[1] llama.cpp allows for MoE weights to be [dynamically offloaded to RAM](https://github.com/ggml-org/llama.cpp/pull/15077). However, this still requires that the machine's sum RAM + VRAM be greater than the total size of the model.
+[1] llama.cpp allows for MoE weights to be [dynamically offloaded to RAM](https://github.com/ggml-org/llama.cpp/pull/15077). However, this still requires that the machine's sum RAM + VRAM be sufficient to hold the total size of the model.
