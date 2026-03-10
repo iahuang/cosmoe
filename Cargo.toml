@@ -10,5 +10,8 @@ candle-examples = { version = "0.9.2", features = ["metal"] }
 candle-nn = { version = "0.9.2", features = ["metal"] }
 candle-transformers = { version = "0.9.2", features = ["metal"] }
 hf-hub = "0.4.3"
+libc = "0.2"
+safetensors = "0.4"
+serde_json = "1"
 thiserror = "2.0.18"
 tokenizers = "0.22.2"

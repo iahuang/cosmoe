@@ -400,6 +400,9 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "hf-hub",
+ "libc",
+ "safetensors 0.4.5",
+ "serde_json",
  "thiserror 2.0.18",
  "tokenizers",
 ]

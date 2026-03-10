@@ -1,10 +1,13 @@
 mod mixtral_offloading;
 mod mixtral_original;
 mod expert_cache;
+mod pread_loader;
 
 use anyhow::{Error as E, Result};
 
 use mixtral_offloading::{Config, Model};
+
+use std::sync::Arc;
 
 use candle_core::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
@@ -12,6 +15,8 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
+
+use pread_loader::PreadTensorLoader;
 
 struct TextGeneration {
     model: Model,
@@ -195,9 +200,12 @@ fn main() -> Result<()> {
     let start = std::time::Instant::now();
     let config = Config::v0_1_8x7b(args.use_flash_attn);
     let device = candle_examples::device(false)?;
-    let dtype = device.bf16_default_to_f32();
+    let dtype = DType::BF16;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    let model = Model::new(&config, 9, vb)?;
+    let expert_loader = Arc::new(
+        PreadTensorLoader::new(&filenames).map_err(|e| anyhow::anyhow!("{}", e))?,
+    );
+    let model = Model::new(&config, 9, vb, expert_loader)?;
     println!("loaded the model in {:?}", start.elapsed());
 
     let mut pipeline = TextGeneration::new(

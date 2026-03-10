@@ -24,6 +24,7 @@ use candle_nn::{Linear, RmsNorm, linear_no_bias};
 use std::sync::Arc;
 
 use crate::expert_cache::{ExpertCache, ModuleFactoryResult};
+use crate::pread_loader::PreadTensorLoader;
 
 /// https://github.com/huggingface/transformers/blob/1a585c1222a56bcaecc070966d558d4a9d862e83/src/transformers/models/mixtral/configuration_mixtral.py#L113
 #[derive(Debug, Clone, PartialEq)]
@@ -420,6 +421,7 @@ impl Model {
         cfg: &Config,
         expert_cache_occupancy_limit: usize,
         vb: VarBuilder<'static>,
+        expert_loader: Arc<PreadTensorLoader>,
     ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
@@ -435,15 +437,21 @@ impl Model {
         let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
 
         let cfg_f = cfg.clone();
-        let layers_vb = vb.pp("model").pp("layers");
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+        let load_count = std::sync::atomic::AtomicUsize::new(0);
 
         let factory: Box<ExpertFactory<BlockSparseTop2MLP>> = Box::new(move |layer, expert| {
-            let expert_vb = layers_vb
-                .pp(layer)
-                .pp("block_sparse_moe")
-                .pp("experts")
-                .pp(expert);
-            Ok(BlockSparseTop2MLP::new(&cfg_f, expert_vb)?)
+            let n = load_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let expert_vb = expert_loader.var_builder(
+                dtype,
+                &device,
+                &format!("model.layers.{}.block_sparse_moe.experts.{}", layer, expert),
+            );
+            let start = std::time::Instant::now();
+            let result = BlockSparseTop2MLP::new(&cfg_f, expert_vb);
+            println!("BlockSparseTop2MLP::new(layer={}, expert={}, load#={}) took {:?}", layer, expert, n, start.elapsed());
+            Ok(result?)
         });
         let expert_cache = ExpertCache::new(
             cfg.num_hidden_layers,
