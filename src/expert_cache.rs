@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use std::sync::Arc;
+
 use candle_core::{Device, quantized::QTensor};
 
 use crate::{
@@ -81,7 +83,7 @@ pub struct ExpertCacheConfig<T: candle_nn::Module> {
     /// The device to load the tensors on.
     pub device: Device,
     /// The model loader to load the tensors from.
-    pub loader: PreadTensorLoader,
+    pub loader: Arc<PreadTensorLoader>,
 }
 
 impl<T: candle_nn::Module> ExpertCache<T> {
@@ -113,6 +115,10 @@ impl<T: candle_nn::Module> ExpertCache<T> {
         }
     }
 
+    pub fn occupancy_limit(&self) -> usize {
+        self.occupancy_limit
+    }
+
     /// Sets the current prediction layer. This is used by the eviction policy to determine which expert(s) to evict.
     pub fn set_current_layer(&mut self, layer: usize) {
         self.evictor_current_layer = layer;
@@ -131,6 +137,23 @@ impl<T: candle_nn::Module> ExpertCache<T> {
                 }
             }
             curr_layer = neg_mod(curr_layer as i64 - 1, self.n_layers as i64) as usize;
+        }
+
+        // Debug: dump cache state on eviction failure
+        eprintln!("=== No eviction candidate! current_layer={}, occupancy={}/{} ===",
+            self.evictor_current_layer, self.occupancy_current, self.occupancy_limit);
+        for layer in 0..self.n_layers {
+            for expert in 0..self.n_experts_per_layer {
+                let entry = self.get_entry(layer, expert).unwrap();
+                let state = match &entry.state {
+                    ExpertCacheEntryState::Empty => "E",
+                    ExpertCacheEntryState::Pending => "P",
+                    ExpertCacheEntryState::Loaded(_) => "L",
+                };
+                if !matches!(entry.state, ExpertCacheEntryState::Empty) {
+                    eprintln!("  layer={} expert={} state={} evictable={}", layer, expert, state, entry.evictable);
+                }
+            }
         }
 
         Err(ExpertCacheError::NoEvictionCandidate)

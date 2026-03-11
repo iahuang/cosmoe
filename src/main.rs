@@ -8,8 +8,6 @@ use anyhow::{Error as E, Result};
 
 use mixtral_offloading::{Config, Model};
 
-use std::sync::Arc;
-
 use candle_core::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::generation::LogitsProcessor;
@@ -72,7 +70,6 @@ impl TextGeneration {
             Some(token) => token,
             None => anyhow::bail!("cannot find the </s> token"),
         };
-        let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
@@ -102,15 +99,13 @@ impl TextGeneration {
                 std::io::stdout().flush()?;
             }
         }
-        let dt = start_gen.elapsed();
         if let Some(rest) = self.tokenizer.decode_rest().map_err(E::msg)? {
             print!("{rest}");
         }
         std::io::stdout().flush()?;
-        println!(
-            "\n{generated_tokens} tokens generated ({:.2} token/s)",
-            generated_tokens as f64 / dt.as_secs_f64(),
-        );
+
+        self.model.stats.print_summary();
+        self.model.loader.print_io_stats();
         Ok(())
     }
 }
@@ -119,34 +114,15 @@ impl TextGeneration {
 struct Args {
     use_flash_attn: bool,
     prompt: String,
-
-    /// The temperature used to generate samples.
     temperature: Option<f64>,
-
-    /// Nucleus sampling probability cutoff.
     top_p: Option<f64>,
-
-    /// The seed to use when generating random samples.
     seed: u64,
-
-    /// The length of the sample to generate (in tokens).
     sample_len: usize,
-
-    /// HF repo for the GGUF model file.
     model_id: String,
-
-    /// Filename of the GGUF file within the repo.
     gguf_filename: String,
-
-    /// HF repo for the tokenizer (GGUF repos often don't include one).
     tokenizer_repo: String,
-
     tokenizer_file: Option<String>,
-
-    /// Penalty to be applied for repeating tokens, 1. means no penalty.
     repeat_penalty: f32,
-
-    /// The context size to consider for the repeat penalty.
     repeat_last_n: usize,
 }
 
@@ -157,7 +133,7 @@ fn main() -> Result<()> {
         temperature: None,
         top_p: None,
         seed: 299792458,
-        sample_len: 10000,
+        sample_len: 5,
         model_id: "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF".to_string(),
         gguf_filename: "mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf".to_string(),
         tokenizer_repo: "mistralai/Mixtral-8x7B-Instruct-v0.1".to_string(),
@@ -183,14 +159,12 @@ fn main() -> Result<()> {
     let start = std::time::Instant::now();
     let api = Api::new()?;
 
-    // Download tokenizer from the original model repo.
     let tokenizer_repo = api.repo(Repo::new(args.tokenizer_repo, RepoType::Model));
     let tokenizer_filename = match args.tokenizer_file {
         Some(file) => std::path::PathBuf::from(file),
         None => tokenizer_repo.get("tokenizer.json")?,
     };
 
-    // Download the GGUF file.
     let gguf_repo = api.repo(Repo::new(args.model_id, RepoType::Model));
     let gguf_path = gguf_repo.get(&args.gguf_filename)?;
     println!("retrieved the files in {:?}", start.elapsed());
@@ -201,11 +175,15 @@ fn main() -> Result<()> {
     let config = Config::v0_1_8x7b(args.use_flash_attn);
     let device = candle_examples::device(false)?;
 
-    // Create the GGUF-based tensor loader.
-    let loader = PreadTensorLoader::new(&gguf_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let loader = std::sync::Arc::new(
+        PreadTensorLoader::new(&gguf_path).map_err(|e| anyhow::anyhow!("{}", e))?,
+    );
 
-    let model = Model::new(&config, 9, loader, &device)?;
+    let model = Model::new(&config, 16, loader, &device)?;
     println!("loaded the model in {:?}", start.elapsed());
+
+    // Reset I/O stats so we only measure expert loading during inference.
+    model.loader.reset_stats();
 
     let mut pipeline = TextGeneration::new(
         model,

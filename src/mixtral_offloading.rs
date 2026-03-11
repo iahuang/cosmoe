@@ -9,6 +9,7 @@ use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::Activation;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::expert_cache::{ExpertCache, ExpertCacheConfig, ExpertFactoryResult};
 use crate::pread_loader::PreadTensorLoader;
@@ -260,8 +261,10 @@ impl Attention {
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        let key_states = candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?;
-        let value_states = candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
+        let key_states =
+            candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?;
+        let value_states =
+            candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
 
         let attn_output = if self.use_flash_attn {
             let q = query_states.transpose(1, 2)?;
@@ -271,7 +274,8 @@ impl Attention {
             flash_attn(&q, &k, &v, softmax_scale, q_len > 1)?.transpose(1, 2)?
         } else {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+            let attn_weights =
+                (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
 
             let attn_weights = match attention_mask {
                 None => attn_weights,
@@ -298,7 +302,6 @@ struct BlockSparseTop2MLP {
 }
 
 impl BlockSparseTop2MLP {
-    /// Construct an expert from 3 QTensors loaded from the GGUF file.
     fn from_qtensors(w1: QTensor, w2: QTensor, w3: QTensor, act_fn: Activation) -> Result<Self> {
         Ok(Self {
             w1: Linear::from_qtensor(w1)?,
@@ -344,6 +347,8 @@ impl SparseMoeBlock {
         &self,
         xs: &Tensor,
         expert_cache: &mut ExpertCache<BlockSparseTop2MLP>,
+        block_time: &mut Duration,
+        moe_compute_time: &mut Duration,
     ) -> Result<Tensor> {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
@@ -372,20 +377,51 @@ impl SparseMoeBlock {
             }
         }
 
+        // Collect active experts (those with at least one token routed to them).
+        let active_experts: Vec<usize> = (0..self.num_local_experts)
+            .filter(|i| !top_x[*i].is_empty())
+            .collect();
+
+        // Batch active experts into groups that fit in the cache.
+        let cache_limit = expert_cache.occupancy_limit();
+        let batches: Vec<Vec<usize>> = active_experts
+            .chunks(cache_limit)
+            .map(|c| c.to_vec())
+            .collect();
+
         let mut ys = xs.zeros_like()?;
-        for expert_idx in 0..self.num_local_experts {
-            let top_x = &top_x[expert_idx];
-            if top_x.is_empty() {
-                continue;
+        for (i, batch) in batches.iter().enumerate() {
+            // Prefetch next batch while computing current batch.
+            if let Some(next) = batches.get(i + 1) {
+                for &expert_idx in next {
+                    expert_cache.prefetch(self.this_layer, expert_idx)?;
+                }
             }
-            let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-            let selected_rws =
-                Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?.reshape(((), 1))?;
-            let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
-            let expert_layer = expert_cache.get_blocking(self.this_layer, expert_idx)?;
-            let current_hidden_states = expert_layer.forward(&current_state)?;
-            let current_hidden_states = current_hidden_states.broadcast_mul(&selected_rws)?;
-            ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
+
+            // Wait for current batch to be loaded.
+            let wait_start = Instant::now();
+            let pairs: Vec<_> = batch.iter().map(|&e| (self.this_layer, e)).collect();
+            expert_cache.wait_for_experts(&pairs)?;
+            *block_time += wait_start.elapsed();
+
+            // Dispatch tokens to each expert in this batch.
+            let t_compute = Instant::now();
+            for &expert_idx in batch {
+                let top_x_slice = &top_x[expert_idx];
+                let top_x_tensor = Tensor::new(top_x_slice.as_slice(), xs.device())?;
+                let selected_rws_tensor =
+                    Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?
+                        .reshape(((), 1))?;
+                let current_state =
+                    xs.index_select(&top_x_tensor, 0)?.reshape(((), hidden_dim))?;
+                let expert_layer =
+                    expert_cache.get_blocking(self.this_layer, expert_idx)?;
+                let current_hidden_states = expert_layer.forward(&current_state)?;
+                let current_hidden_states =
+                    current_hidden_states.broadcast_mul(&selected_rws_tensor)?;
+                ys = ys.index_add(&top_x_tensor, &current_hidden_states, 0)?;
+            }
+            *moe_compute_time += t_compute.elapsed();
         }
 
         let ys = ys.reshape((b_size, seq_len, hidden_dim))?;
@@ -440,38 +476,141 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         expert_cache: &mut ExpertCache<BlockSparseTop2MLP>,
+        block_time: &mut Duration,
+        attn_time: &mut Duration,
+        moe_compute_time: &mut Duration,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
+        let t_attn = Instant::now();
         let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        *attn_time += t_attn.elapsed();
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?;
-        let xs = self.block_sparse_moe.forward(&xs, expert_cache)?;
+        let xs = self.block_sparse_moe.forward(&xs, expert_cache, block_time, moe_compute_time)?;
         residual + xs
+    }
+}
+
+// ── Inference Stats ───────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct InferenceStats {
+    pub prefill_duration: Duration,
+    pub prefill_tokens: usize,
+    pub prefill_block_time: Duration,
+    pub prefill_attn_time: Duration,
+    pub prefill_moe_compute_time: Duration,
+    pub generation_duration: Duration,
+    pub generation_tokens: usize,
+    pub generation_block_time: Duration,
+    pub generation_attn_time: Duration,
+    pub generation_moe_compute_time: Duration,
+}
+
+impl InferenceStats {
+    pub fn new() -> Self {
+        Self {
+            prefill_duration: Duration::ZERO,
+            prefill_tokens: 0,
+            prefill_block_time: Duration::ZERO,
+            prefill_attn_time: Duration::ZERO,
+            prefill_moe_compute_time: Duration::ZERO,
+            generation_duration: Duration::ZERO,
+            generation_tokens: 0,
+            generation_block_time: Duration::ZERO,
+            generation_attn_time: Duration::ZERO,
+            generation_moe_compute_time: Duration::ZERO,
+        }
+    }
+
+    pub fn print_summary(&self) {
+        println!("\n--- Inference Stats ---");
+        if self.prefill_tokens > 0 {
+            let prefill_tok_s = self.prefill_tokens as f64 / self.prefill_duration.as_secs_f64();
+            let compute = self.prefill_attn_time + self.prefill_moe_compute_time;
+            println!(
+                "Prefill:     {:>5} tokens in {:.1}ms ({:.1} tok/s)",
+                self.prefill_tokens,
+                self.prefill_duration.as_secs_f64() * 1000.0,
+                prefill_tok_s,
+            );
+            println!(
+                "  Attention:   {:.1}ms ({:.1}%)",
+                self.prefill_attn_time.as_secs_f64() * 1000.0,
+                self.prefill_attn_time.as_secs_f64() / self.prefill_duration.as_secs_f64() * 100.0,
+            );
+            println!(
+                "  MoE compute: {:.1}ms ({:.1}%)",
+                self.prefill_moe_compute_time.as_secs_f64() * 1000.0,
+                self.prefill_moe_compute_time.as_secs_f64() / self.prefill_duration.as_secs_f64() * 100.0,
+            );
+            println!(
+                "  Blocked:     {:.1}ms ({:.1}%)",
+                self.prefill_block_time.as_secs_f64() * 1000.0,
+                self.prefill_block_time.as_secs_f64() / self.prefill_duration.as_secs_f64() * 100.0,
+            );
+            println!(
+                "  Other:       {:.1}ms ({:.1}%)",
+                (self.prefill_duration - compute - self.prefill_block_time).as_secs_f64() * 1000.0,
+                (self.prefill_duration - compute - self.prefill_block_time).as_secs_f64() / self.prefill_duration.as_secs_f64() * 100.0,
+            );
+        }
+        if self.generation_tokens > 0 {
+            let gen_tok_s = self.generation_tokens as f64 / self.generation_duration.as_secs_f64();
+            let compute = self.generation_attn_time + self.generation_moe_compute_time;
+            println!(
+                "Generation:  {:>5} tokens in {:.1}ms ({:.2} tok/s)",
+                self.generation_tokens,
+                self.generation_duration.as_secs_f64() * 1000.0,
+                gen_tok_s,
+            );
+            println!(
+                "  Attention:   {:.1}ms ({:.1}%)",
+                self.generation_attn_time.as_secs_f64() * 1000.0,
+                self.generation_attn_time.as_secs_f64() / self.generation_duration.as_secs_f64() * 100.0,
+            );
+            println!(
+                "  MoE compute: {:.1}ms ({:.1}%)",
+                self.generation_moe_compute_time.as_secs_f64() * 1000.0,
+                self.generation_moe_compute_time.as_secs_f64() / self.generation_duration.as_secs_f64() * 100.0,
+            );
+            println!(
+                "  Blocked:     {:.1}ms ({:.1}%)",
+                self.generation_block_time.as_secs_f64() * 1000.0,
+                self.generation_block_time.as_secs_f64() / self.generation_duration.as_secs_f64() * 100.0,
+            );
+            println!(
+                "  Other:       {:.1}ms ({:.1}%)",
+                (self.generation_duration - compute - self.generation_block_time).as_secs_f64() * 1000.0,
+                (self.generation_duration - compute - self.generation_block_time).as_secs_f64() / self.generation_duration.as_secs_f64() * 100.0,
+            );
+        }
     }
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
 pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
     sliding_window: usize,
+    num_hidden_layers: usize,
+    num_local_experts: usize,
     device: Device,
     expert_cache: ExpertCache<BlockSparseTop2MLP>,
+    pub loader: Arc<PreadTensorLoader>,
+    pub stats: InferenceStats,
 }
-
-type ExpertFactory<T> = dyn Fn(usize, usize) -> ExpertFactoryResult<T> + Send + Sync + 'static;
 
 impl Model {
     pub fn new(
         cfg: &Config,
         expert_cache_occupancy_limit: usize,
-        loader: PreadTensorLoader,
+        loader: Arc<PreadTensorLoader>,
         device: &Device,
     ) -> Result<Self> {
         // Load non-expert tensors explicitly.
@@ -479,7 +618,6 @@ impl Model {
             Ok(Arc::new(loader.load_qtensor(name, device)?))
         };
 
-        // Embedding: dequantize to F32 at load time
         let embed_weight_qt = t("token_embd.weight")?;
         let embed_weight = embed_weight_qt.dequantize(device)?;
         let embed_tokens = candle_nn::Embedding::new(embed_weight, cfg.hidden_size);
@@ -509,7 +647,6 @@ impl Model {
         let output_norm_qt = t("output_norm.weight")?;
         let norm = RmsNorm::from_qtensor(&output_norm_qt, cfg.rms_norm_eps)?;
 
-        // lm_head: may share weights with token_embd in some models
         let lm_head_tensor = loader
             .load_qtensor("output.weight", device)
             .map(Arc::new)
@@ -517,8 +654,6 @@ impl Model {
         let lm_head = Linear::from_arc(lm_head_tensor)?;
 
         let cfg_f = cfg.clone();
-        let device_f = device.clone();
-        let load_count = std::sync::atomic::AtomicUsize::new(0);
 
         let expert_cache = ExpertCache::new(ExpertCacheConfig {
             n_layers: cfg.num_hidden_layers,
@@ -537,12 +672,7 @@ impl Model {
                     .tensors
                     .remove(&format!("blk.{layer}.ffn_up.{expert}.weight"))
                     .unwrap();
-                Ok(BlockSparseTop2MLP::from_qtensors(
-                    w1,
-                    w2,
-                    w3,
-                    cfg_f.hidden_act,
-                )?)
+                Ok(BlockSparseTop2MLP::from_qtensors(w1, w2, w3, cfg_f.hidden_act)?)
             }),
             expert_spec: Box::new(|layer, expert| {
                 vec![
@@ -553,7 +683,7 @@ impl Model {
             }),
             occupancy_limit: expert_cache_occupancy_limit,
             device: device.clone(),
-            loader: loader,
+            loader: loader.clone(),
         });
 
         Ok(Self {
@@ -562,8 +692,12 @@ impl Model {
             norm,
             lm_head,
             sliding_window: cfg.sliding_window,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_local_experts: cfg.num_local_experts,
             device: device.clone(),
             expert_cache,
+            loader,
+            stats: InferenceStats::new(),
         })
     }
 
@@ -595,13 +729,22 @@ impl Model {
             .to_dtype(DType::F32)
     }
 
+    /// Prefetch all experts for the given layer.
+    fn prefetch_all_experts(&mut self, layer_idx: usize) -> Result<()> {
+        for expert_idx in 0..self.num_local_experts {
+            self.expert_cache.prefetch(layer_idx, expert_idx)?;
+        }
+        Ok(())
+    }
+
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        println!(
-            "Forwarding {:?} ids with seqlen_offset: {}",
-            input_ids.shape(),
-            seqlen_offset
-        );
+        let step_start = Instant::now();
+        let mut block_time = Duration::ZERO;
+        let mut attn_time = Duration::ZERO;
+        let mut moe_compute_time = Duration::ZERO;
+
         let (b_size, seq_len) = input_ids.dims2()?;
+        let is_prefill = seq_len > 1;
         let attention_mask = if seq_len <= 1 {
             None
         } else {
@@ -610,17 +753,58 @@ impl Model {
         };
         let mut xs = self.embed_tokens.forward(input_ids)?;
 
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+        // Prefetch layer 0's experts before starting the layer loop.
+        for expert_idx in 0..self.num_local_experts {
+            self.expert_cache.prefetch(0, expert_idx)?;
+        }
+
+        let num_layers = self.layers.len();
+        let num_experts = self.num_local_experts;
+        for layer_idx in 0..num_layers {
             self.expert_cache.set_current_layer(layer_idx);
-            xs = layer.forward(
+
+            xs = self.layers[layer_idx].forward(
                 &xs,
                 attention_mask.as_ref(),
                 seqlen_offset,
                 &mut self.expert_cache,
-            )?
+                &mut block_time,
+                &mut attn_time,
+                &mut moe_compute_time,
+            )?;
+
+            // Prefetch all experts for the next layer now that the current
+            // layer's experts are eligible for eviction.
+            let next_layer = layer_idx + 1;
+            if next_layer < num_layers {
+                self.expert_cache.set_current_layer(next_layer);
+                self.expert_cache.drain()?;
+                for expert_idx in 0..num_experts {
+                    self.expert_cache.prefetch(next_layer, expert_idx)?;
+                }
+            }
         }
-        xs.narrow(1, seq_len - 1, 1)?
+
+        let logits = xs
+            .narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
-            .apply(&self.lm_head)
+            .apply(&self.lm_head)?;
+
+        let step_duration = step_start.elapsed();
+        if is_prefill {
+            self.stats.prefill_duration += step_duration;
+            self.stats.prefill_tokens += seq_len;
+            self.stats.prefill_block_time += block_time;
+            self.stats.prefill_attn_time += attn_time;
+            self.stats.prefill_moe_compute_time += moe_compute_time;
+        } else {
+            self.stats.generation_duration += step_duration;
+            self.stats.generation_tokens += 1;
+            self.stats.generation_block_time += block_time;
+            self.stats.generation_attn_time += attn_time;
+            self.stats.generation_moe_compute_time += moe_compute_time;
+        }
+
+        Ok(logits)
     }
 }

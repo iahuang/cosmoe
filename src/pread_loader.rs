@@ -20,7 +20,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Holds an open file descriptor and the parsed GGUF tensor index.
 /// Loads tensors on demand via pread() into QTensors.
@@ -33,6 +34,14 @@ pub struct PreadTensorLoader {
     /// Reusable read buffers keyed by byte size. Avoids repeated allocation
     /// and page faulting for the temporary Vec<u8> used by pread.
     read_buffers: Mutex<HashMap<usize, Vec<u8>>>,
+    /// Cumulative bytes read via pread (atomic for thread-safe access from I/O thread).
+    pub bytes_read: AtomicU64,
+    /// Cumulative time spent in pread syscalls (nanoseconds).
+    pub pread_nanos: AtomicU64,
+    /// Cumulative time spent creating QTensors from raw data (nanoseconds).
+    pub qtensor_nanos: AtomicU64,
+    /// Number of tensors loaded.
+    pub tensors_loaded: AtomicU64,
 }
 
 impl PreadTensorLoader {
@@ -60,7 +69,50 @@ impl PreadTensorLoader {
             tensor_data_offset: content.tensor_data_offset,
             metadata: content.metadata,
             read_buffers: Mutex::new(HashMap::new()),
+            bytes_read: AtomicU64::new(0),
+            pread_nanos: AtomicU64::new(0),
+            qtensor_nanos: AtomicU64::new(0),
+            tensors_loaded: AtomicU64::new(0),
         })
+    }
+
+    /// Reset I/O stats (call after startup loading to measure only expert loading).
+    pub fn reset_stats(&self) {
+        self.bytes_read.store(0, Ordering::Relaxed);
+        self.pread_nanos.store(0, Ordering::Relaxed);
+        self.qtensor_nanos.store(0, Ordering::Relaxed);
+        self.tensors_loaded.store(0, Ordering::Relaxed);
+    }
+
+    /// Print I/O throughput summary.
+    pub fn print_io_stats(&self) {
+        let bytes = self.bytes_read.load(Ordering::Relaxed);
+        let pread_ns = self.pread_nanos.load(Ordering::Relaxed);
+        let qtensor_ns = self.qtensor_nanos.load(Ordering::Relaxed);
+        let count = self.tensors_loaded.load(Ordering::Relaxed);
+
+        if count == 0 {
+            return;
+        }
+
+        let pread_secs = pread_ns as f64 / 1e9;
+        let qtensor_secs = qtensor_ns as f64 / 1e9;
+        let bytes_f = bytes as f64;
+
+        let throughput_gb_s = if pread_secs > 0.0 {
+            (bytes_f / (1024.0 * 1024.0 * 1024.0)) / pread_secs
+        } else {
+            0.0
+        };
+
+        println!(
+            "I/O Stats:   {} tensors, {:.1} MB read, pread {:.1}ms ({:.2} GB/s), qtensor {:.1}ms",
+            count,
+            bytes_f / (1024.0 * 1024.0),
+            pread_secs * 1000.0,
+            throughput_gb_s,
+            qtensor_secs * 1000.0,
+        );
     }
 
     /// Load a single tensor by name onto the given device as a QTensor.
@@ -79,7 +131,6 @@ impl PreadTensorLoader {
         let fd = self.file.as_raw_fd();
 
         // Take the reusable buffer from the pool (or allocate + fault in a new one).
-        let t0 = std::time::Instant::now();
         let mut buf = self
             .read_buffers
             .lock()
@@ -93,37 +144,33 @@ impl PreadTensorLoader {
                 }
                 b
             });
-        let t1 = std::time::Instant::now();
 
+        let t_pread = std::time::Instant::now();
         pread_exact(fd, &mut buf, absolute_offset as i64).map_err(|e| {
             candle_core::Error::Msg(format!("pread failed for '{}': {}", name, e))
         })?;
-        let t2 = std::time::Instant::now();
+        let pread_elapsed = t_pread.elapsed();
 
+        let t_qtensor = std::time::Instant::now();
         let qtensor = qtensor_from_ggml(
             info.ggml_dtype,
             &buf,
             info.shape.dims().to_vec(),
             device,
         )?;
-        let t3 = std::time::Instant::now();
+        let qtensor_elapsed = t_qtensor.elapsed();
 
         // Return buffer to the pool for reuse.
         self.read_buffers.lock().unwrap().insert(size, buf);
 
-        println!(
-            "  load({}): buf={:.1}ms pread={:.1}ms qtensor={:.1}ms total={:.1}ms ({} bytes, {:?})",
-            name,
-            (t1 - t0).as_secs_f64() * 1000.0,
-            (t2 - t1).as_secs_f64() * 1000.0,
-            (t3 - t2).as_secs_f64() * 1000.0,
-            (t3 - t0).as_secs_f64() * 1000.0,
-            size,
-            info.ggml_dtype,
-        );
+        // Accumulate stats.
+        self.bytes_read.fetch_add(size as u64, Ordering::Relaxed);
+        self.pread_nanos.fetch_add(pread_elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.qtensor_nanos.fetch_add(qtensor_elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.tensors_loaded.fetch_add(1, Ordering::Relaxed);
+
         Ok(qtensor)
     }
-
 }
 
 /// pread() wrapper that reads exactly `buf.len()` bytes, retrying on partial reads.

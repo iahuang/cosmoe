@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use candle_core::{Device, quantized::QTensor};
 
 use crate::pread_loader::PreadTensorLoader;
@@ -21,7 +23,7 @@ pub struct Prefetcher<T: Primitive> {
 }
 
 impl<T: Primitive> Prefetcher<T> {
-    pub fn new(loader: PreadTensorLoader, device: Device) -> Self {
+    pub fn new(loader: Arc<PreadTensorLoader>, device: Device) -> Self {
         let (req_tx, req_rx) = flume::unbounded::<PrefetchRequest<T>>();
         let (res_tx, res_rx) = flume::unbounded::<PrefetchResponse<T>>();
 
